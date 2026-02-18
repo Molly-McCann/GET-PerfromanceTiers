@@ -1,0 +1,1893 @@
+---
+title: "GETReport"
+author: "Molly McCann & Taylor Hill"
+date: "2025-02-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load libraries & data
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr) 
+library(cluster) # Load cluster
+library(factoextra) # clustering algorithms & visualization
+library(sparcl) # Sparse Clustering
+library(ggdark) 
+library(nlme) 
+library(minpack.lm)
+library(tidyverse)
+```
+
+```{r}
+test_measure <- read.csv("~/Downloads/Performance/Project/test_measure.csv")
+subject_info <- read.csv("~/Downloads/Performance/Project/subject-info.csv")
+
+# Combine data based on ID and ID_test major
+data <- merge(test_measure, subject_info, by = c("ID", "ID_test"))
+```
+
+## Data cleaning
+
+Found that some athletes have more than 1 GET results
+
+```{r}
+# Originally thought to be 992 but returns 857 unique ids
+length(unique(subject_info$ID))
+
+# Find the repeated IDs in the subject_info
+# This could possibly mean that the same athlete took the test multiple times at possibly different ages or weights etc
+duplicates <- subject_info |>
+  group_by(ID) |>
+  filter(n() > 1)
+
+# Create a df with the frequency of times the ID shows up in the duplicates df
+duplicate_counts <- subject_info |>
+  group_by(ID) |>
+  summarise(frequency = n()) |>
+  filter(frequency > 1)  # Keep only duplicated IDs
+```
+
+Take the most recent test in the df to keep for the clustering
+
+```{r}
+# Get the ID_test for the most recent GET test 
+max_age_test <- subject_info |>
+  group_by(ID) |>
+  filter(Age == max(Age)) |>
+  select(ID, Age, ID_test)  # Select relevant columns
+
+# Duplicate the test_measure df and name it test_measure2 as storage of original df 
+test_measure2 <- test_measure
+
+# Pull the ID_test for all the athletes who only took 1 GET
+single_attempt_ids <- subject_info |>
+  count(ID) |>
+  filter(n == 1) |>
+  pull(ID)
+
+single_attempt_tests <- subject_info |>
+  filter(ID %in% single_attempt_ids) |>
+  select(ID, ID_test)
+
+# Duplicate subject_info df and name it subject_info2 as storage of original df
+subject_info2 <- subject_info
+
+# Use the max_age_test to add onto single_attempt_tests
+recent_tests <- max_age_test |>
+  left_join(single_attempt_tests, by = "ID_test")
+
+# Remove the rows with ID_test values that are not the most recent test from subject_info
+subject_info <- subject_info |>
+  filter(ID_test %in% recent_tests$ID_test)
+
+# Edit test_measures to only include the most recent test for all athletes
+test_measure <- test_measure |>
+  filter(ID_test %in% recent_tests$ID_test)
+```
+
+Appears that 2 athletes took multiple tests with same Age, Weight, & Height values so cannot tell which was most recent
+Find these and then remove the test with ID_test value ending in 1 
+This step is arbitrary but will provide more data for clustering and allow each athlete 1 entry into the performance tiers 
+
+```{r}
+# Find the athletes with multiple tests still
+same_IDs <- subject_info |>
+  group_by(ID) |>
+  filter(n() > 1)
+
+# Manually remove these rows from subject_info using ID_test values
+# Remove rows where ID_test == 388_1 | 155_1
+subject_info <- subject_info |>
+  filter(!ID_test %in% c("388_1", "155_1"))
+
+# Manually remove these rows from test_measure using ID_test values 
+# Remove rows where ID_test == 388_1 | 155_1
+test_measure <- test_measure |>
+  filter(!ID_test %in% c("388_1", "155_1"))
+```
+
+Setting up the data to do analysis on athletes who have taken more than 1 GET. 
+
+```{r}
+# Will use this df to look at change in athletes metrics over time/the more GETs taken
+more_1_tests <- test_measure2 |>
+  filter(ID_test %in% duplicates$ID_test)
+
+# If this is equivalent to duplicate_counts obs then should be correct
+length(unique(more_1_tests$ID)) 
+```
+
+Quickly compare how many athletes of each gender are in the df
+
+```{r}
+male <- sum(subject_info$Sex == 0)
+female <- sum(subject_info$Sex == 1)
+print(paste("Males:", male, "Females:", female))
+```
+
+## EDA questions to look into
+### Better understand the data 
+
+1. Is the recovery speed of the treadmill the same for all research participants 
+-- Yes the recovery and warmup are both set at 5 km/h 
+
+2. When does recovery start? What are the requirements for the treadmill speed to be set at the recovery pace
+-- The start time for recover differs from participant to participant 
+-- The effort portion of the test concludes when the oxygen consumption was saturated
+
+* The code below works but possible that it is not complete, as some warmup end = time 0 which appears to be incorrect 
+* Will need to look into this before solidifying any analysis outside of EDA
+
+```{r}
+subject_info <- subject_info |>
+  mutate(Warmup_start = 0, Warmup_end = NA, Recovery_start = NA, Recovery_end = NA)
+
+for (id in unique(subject_info$ID)) {
+  subject_subset <- test_measure |> 
+    filter(ID == id)
+  
+  # Find Warmup_end: First time speed increases from to a value greater than 5.1
+  warmup_end_time <- subject_subset |>
+    filter(lag(Speed, default = 0) == 5.0 & Speed >= 5.1) |>
+    slice_head(n = 1) |>
+    pull(time)
+  
+  # Find Recovery_start: First time speed decreases to a value less than 5.0
+  recovery_start_time <- subject_subset |>
+    filter(lag(Speed, default = first(Speed)) > 5.0 & Speed <= 5.0) |>
+    slice_head(n = 1) |>
+    pull(time)
+  
+  # Find Recovery_end: The last time value for this ID
+  recovery_end_time <- max(subject_subset$time, na.rm = TRUE)
+  
+  # Update subject_info with found values
+  subject_info <- subject_info |>
+    mutate(
+      Warmup_end = ifelse(ID == id, warmup_end_time, Warmup_end),
+      Recovery_start = ifelse(ID == id, recovery_start_time, Recovery_start),
+      Recovery_end = ifelse(ID == id, recovery_end_time, Recovery_end)
+    )
+}
+```
+
+```{r}
+subject_info <- subject_info |>
+  mutate(Warmup_start = 0, Warmup_end = NA, Recovery_start = NA, Recovery_end = NA)
+
+results <- list()
+
+for (id in unique(subject_info$ID)) {
+  subject_subset <- test_measure |> 
+    filter(ID == id)
+  
+  # Find Warmup_end: First time speed increases to a value greater than 5.1
+  warmup_end_time <- subject_subset |>
+    filter(lag(Speed, default = 0) <= 5.0 & Speed >= 5.1) |>
+    slice_head(n = 1) |>
+    pull(time)
+  
+  # Find Recovery_start: First time speed decreases to a value less than 5.0
+  recovery_start_time <- subject_subset |>
+    filter(lag(Speed, default = first(Speed)) > 5.0 & Speed <= 5.0) |>
+    slice_head(n = 1) |>
+    pull(time)
+  
+  # Find Recovery_end: The last time value for this ID
+  recovery_end_time <- max(subject_subset$time, na.rm = TRUE)
+  
+  results[[id]] <- tibble(ID = id, 
+                          Warmup_end = ifelse(length(warmup_end_time) > 0, warmup_end_time, NA),
+                          Recovery_start = ifelse(length(recovery_start_time) > 0, recovery_start_time, NA),
+                          Recovery_end = recovery_end_time)
+}
+
+# Convert list to dataframe and join back with subject_info
+results_df <- bind_rows(results)
+
+subject_info <- left_join(subject_info, results_df, by = "ID") |>
+  mutate(Warmup_end = coalesce(Warmup_end.y, Warmup_end.x),
+         Recovery_start = coalesce(Recovery_start.y, Recovery_start.x),
+         Recovery_end = coalesce(Recovery_end.y, Recovery_end.x)) |>
+  select(-ends_with(".x"), -ends_with(".y"))
+```
+
+3. What is the max treadmill speed for each participant 
+
+```{r}
+calc_max <- function(data, id_column, value_column) {
+  # Group by the ID column and calculate mean for the value column
+  max_values <- data |>
+    group_by(.data[[id_column]]) |>
+    summarize(max_value = max(.data[[value_column]], na.rm = TRUE), .groups = "drop")
+  
+  return(max_values)
+}
+
+speed_max <- calc_max(data, id_column = "ID", value_column = "Speed")
+print(speed_max)
+
+# Add the Max_Speed column to data 
+data <- data |>
+  left_join(speed_max, by = "ID") |>
+  rename(Max_Speed = max_value)
+```
+
+4. When does peak HR first occur and at what speed
+
+```{r}
+# Calculate the max HR for each ID
+peak_hr <- calc_max(data, id_column = "ID", value_column = "HR")
+print(peak_hr)
+
+# Add the Peak_HR as a column in subject_info
+subject_info <- subject_info |>
+  left_join(peak_hr, by = "ID") |>
+  rename(Peak_HR = max_value)
+
+# Add the Peak_HR as a column in data?
+data <- data |>
+  left_join(peak_hr, by = "ID") |>
+  rename(Peak_HR = max_value)
+```
+
+```{r}
+# Find all times when peak HR occurred
+peak_hr_times <- data |>
+  filter(HR == Peak_HR) |> 
+  select(ID, time)
+
+# Find the first time Peak_HR occurs for each ID
+peak_hr_time <- data |>
+  filter(HR == Peak_HR) |> 
+  group_by(ID) |> 
+  summarize(Peak_HR_Time = min(time), .groups = "drop")
+
+# Add peak_hr_time column to subject_info
+subject_info <- subject_info |>
+  left_join(peak_hr_time, by = "ID")
+```
+
+```{r}
+# Find all speeds when peak HR occurred 
+peak_hr_speeds <- data |>
+  filter(HR == Peak_HR) |> 
+  select(ID, Speed)
+
+# Find the speed when Peak_HR first occurs for each ID
+peak_hr_speed <- data |>
+  filter(HR == Peak_HR) |> 
+  group_by(ID) |> 
+  slice_min(time) |>   # Get the first occurrence based on time
+  ungroup() |> 
+  select(ID, Peak_HR_Speed = Speed)  # Rename column
+
+# Add Peak_HR_Speed to subject_info
+# Make sure to use distinct or will get too many obs in subject_info
+subject_info <- subject_info |>
+  left_join(peak_hr_speed |> distinct(ID, .keep_all = TRUE), by = "ID")
+```
+
+5. How much time does each participant spend on the treadmill 
+-- The total amount of time in seconds can be found in the Recovery_end column of subject_info
+
+6. Is recovery a set amount of time for all participants? Or is it unique and stops once a resting HR is achieved? 
+-- Based on code in question 2 it appears that it is unique 
+
+7. Can we say that resting HR is the initial HR the instant recording begins? If so, what is resting HR for each participant? Is resting HR achieved at the end of the recovery or is it just when HR has decreased to a certain degree? 
+-- Making assumption that initial HR is resting HR 
+-- It appears that the initial HR is not equivalent to the last HR, thus recovery does not end when resting HR is achieved, but before that 
+
+```{r}
+test_measure <- test_measure |>
+  mutate(time = as.numeric(time)) 
+
+# Get Initial HR at the lowest available time where HR is NOT NA
+initial_hr <- test_measure |>
+  group_by(ID) |>
+  filter(!is.na(HR)) |>  # Ensure we only consider rows where HR is NOT NA
+  filter(time == min(time)) |>  # Select the lowest available time
+  summarize(Initial_HR = first(HR), .groups = "drop")
+
+# Get Last HR
+last_hr <- test_measure |>
+  group_by(ID) |>
+  slice_max(time, n = 1, with_ties = FALSE) |> 
+  summarize(Last_HR = HR, .groups = "drop")
+
+# Add these as columns to subject_info
+# Use distinct to make sure not to add artificial rows to the obs count
+subject_info <- subject_info |>
+  left_join(initial_hr %>% distinct(ID, .keep_all = TRUE), by = "ID") |>
+  left_join(last_hr %>% distinct(ID, .keep_all = TRUE), by = "ID")
+
+# Check remaining NAs in Initial_HR
+sum(is.na(subject_info$Initial_HR))
+```
+
+## More derived variables 
+
+Current variables:
+* time 
+* Speed
+* HR
+* VO2
+* VCO2
+* RR
+* VE
+* ID_test
+* ID
+* Age
+* Weight
+* Height
+* Humidity 
+* Temperature
+* Sex
+* Warmup_start
+* Warmup_end
+* Recovery_start
+* Recover_end
+* Peak_HR
+* Peak_HR_Time
+* Peak_HR_Speed
+* Initial_HR
+* Last_HR
+
+New variables to create: 
+* HR_recovery_rate 
+* Speed_HR_ratio
+* VO2_Speed_ratio
+* Percent_time_at_peak_HR
+* HR_variability
+* HR_recovery_drop_percent
+* Ventilatory_efficiency
+* Respiratory_exchange_ratio
+* Avg_HR
+* Avg_HR_warmup
+* Avg_HR_effort
+* Avg_HR_recovery
+
+### Creating additional derived variables
+
+1. Create HR_recovery_rate and add to subject_info
+
+```{r}
+# Note without using distinct, there will be artifical rows added to subject_info
+hr_recovery <- subject_info |>
+  group_by(ID) |>
+  summarize(HR_recovery_rate = ((Peak_HR - Last_HR) / (Recovery_end - Recovery_start)), .groups = "drop") |>
+  distinct(ID, .keep_all = TRUE)  # Ensure uniqueness of ID
+
+subject_info <- subject_info |>
+  left_join(hr_recovery, by = "ID")
+```
+
+2. Create Speed_HR_ratio and add to subject_info
+
+```{r}
+# Ensure speed_max has unique IDs before joining
+speed_max <- speed_max |> 
+  distinct(ID, .keep_all = TRUE)
+
+subject_info <- subject_info |>
+  left_join(speed_max, by = "ID") |>
+  rename(Max_Speed = max_value)
+
+speed_hr_ratio <- subject_info |>
+  group_by(ID) |>
+  summarize(Speed_HR_ratio = (Max_Speed/Peak_HR), .groups = "drop")
+
+# Ensure speed_hr_ratio has unique IDs before joining
+speed_hr_ratio <- speed_hr_ratio |> 
+  distinct(ID, .keep_all = TRUE)
+
+subject_info <- subject_info |>
+  left_join(speed_hr_ratio, by = "ID")
+```
+
+3. Create VO2_Speed_ratio and add to subject_info
+
+```{r}
+# Calculate VO2_Max first 
+vo2_max <- calc_max(data, id_column = "ID", value_column = "VO2")
+print(vo2_max)
+
+# Ensure vo2_max has unique IDs before joining
+vo2_max <- vo2_max |> 
+  distinct(ID, .keep_all = TRUE)
+
+# Add the VO2_Max column to subject_info
+subject_info <- subject_info |>
+  left_join(vo2_max, by = "ID") |>
+  rename(VO2_Max = max_value)
+
+vo2_speed_ratio <- subject_info |>
+  group_by(ID) |>
+  summarize(VO2_Speed_ratio = (VO2_Max/Max_Speed), .groups = "drop")
+
+# Ensure vo2_speed_ratio has unique IDs before joining
+vo2_speed_ratio <- vo2_speed_ratio |> 
+  distinct(ID, .keep_all = TRUE)
+
+subject_info <- subject_info |>
+  left_join(vo2_speed_ratio, by = "ID")
+```
+
+4. Make Percent_time_peak_HR and add to subject_info
+
+```{r}
+# Count the number of seconds that peak_HR happens for each unique ID
+peak_hr_summary <- peak_hr_times |>
+  group_by(ID) |>
+  summarize(num_peak_hr_times = n(), .groups = "drop")
+
+# Merge with subject_info to get Recovery_end time for each athlete
+combined_time <- subject_info |>
+  left_join(peak_hr_summary, by = "ID")
+
+combined_time <- combined_time |>
+  mutate(Percent_time_peak_HR = (num_peak_hr_times / Recovery_end)) 
+
+# Ensure combined_time has unique IDs before joining
+combined_time <- combined_time |> 
+  distinct(ID, .keep_all = TRUE)
+
+# Add Percent_time_peak_HR column back into subject_info
+subject_info$Percent_time_peak_HR <- combined_time$Percent_time_peak_HR
+```
+
+5. Create HR_variability and add to subject_info
+
+```{r}
+# Calculate the standard deviation of HR for each ID in test_measure
+HR_sd <- test_measure |>
+  group_by(ID) |>
+  summarize(HR_variability = sd(HR, na.rm = TRUE))
+
+# Ensure HR_sd has unique IDs before joining
+HR_sd <- HR_sd |> 
+  distinct(ID, .keep_all = TRUE)
+
+# Add HR_variability column into subject_info
+subject_info <- subject_info |>
+  left_join(HR_sd, by = "ID")
+```
+
+6. Create HR_recovery_drop_percent and add to subject_info
+
+```{r}
+recovery_HR <- subject_info |>
+  group_by(ID) |>
+  summarize(HR_recovery_drop_percent = ((Peak_HR - Last_HR)/Peak_HR))
+
+# Ensure recovery_HR has unique IDs before joining 
+recovery_HR <- recovery_HR |>
+  distinct(ID, .keep_all = TRUE)
+
+subject_info <- subject_info |>
+  left_join(recovery_HR, by = "ID")
+```
+
+7. Make Ventilatory_efficiency variable then add to subject_info
+
+```{r}
+# Calculate VE/VO2 for each second for each athlete 
+vent_eff <- test_measure |>
+  group_by(ID) |>
+  summarize(Vent_efficiency = VE / VO2, .groups = "drop")
+
+# Ensure vent_eff has unique IDs before joining 
+vent_eff <- vent_eff |>
+  distinct(ID, .keep_all = TRUE)
+
+# Add Vent_efficiency column to test_measure df 
+test_measure <- test_measure |>
+  left_join(vent_eff, by = "ID")
+
+# Take the average for each unique athlete ID 
+avg_vent_eff <- test_measure |>
+  group_by(ID) |>
+  summarize(Avg_ventilatory_efficiency = mean(Vent_efficiency))
+
+# Ensure Avg_ventilatory_efficiency has unique IDs before joining
+avg_vent_eff <- avg_vent_eff |>
+  distinct(ID, .keep_all = TRUE)
+
+# Add column to subject_info df 
+subject_info <- subject_info |>
+  left_join(avg_vent_eff, by = "ID")
+```
+
+8. Make Respiratory_exchange_ratio then add to subject_info
+
+```{r}
+# Calculate VCO2/VO2 for each second for each athlete 
+resp_exch <- test_measure |>
+  group_by(ID) |>
+  summarize(Resp_exchange = VCO2 / VO2, .groups = "drop")
+
+# Ensure vent_eff has unique IDs before joining 
+resp_exch <- resp_exch |>
+  distinct(ID, .keep_all = TRUE)
+
+# Add Vent_efficiency column to test_measure df 
+test_measure <- test_measure |>
+  left_join(resp_exch, by = "ID")
+
+# Take the average for each unique athlete ID 
+avg_resp_exch_ratio <- test_measure |>
+  group_by(ID) |>
+  summarize(Avg_respiratory_exchange_ratio = mean(Resp_exchange))
+
+# Ensure Avg_ventilatory_efficiency has unique IDs before joining
+avg_resp_exch_ratio <- avg_resp_exch_ratio |>
+  distinct(ID, .keep_all = TRUE)
+
+# Add column to subject_info df 
+subject_info <- subject_info |>
+  left_join(avg_resp_exch_ratio, by = "ID")
+```
+
+9. Find the Avg_HR for each period of GET and add to subject_info
+
+```{r}
+# Calculate Avg_HR_warmup, Avg_HR_effort, Avg_HR_recovery for each unique ID
+avg_hr_segments <- test_measure |>
+  left_join(subject_info, by = "ID") |>
+  mutate(
+    # Check if the time for each row falls within the warmup segment
+    in_warmup = time >= Warmup_start & time <= Warmup_end,
+    # Check if the time for each row falls within the effort segment
+    in_effort = time > Warmup_end & time <= Recovery_start,
+    # Check if the time for each row falls within the recovery segment
+    in_recovery = time > Recovery_start & time <= Recovery_end) |>
+  group_by(ID) |>
+  summarize(
+    Avg_HR_warmup = mean(HR[in_warmup], na.rm = TRUE),
+    Avg_HR_effort = mean(HR[in_effort], na.rm = TRUE),
+    Avg_HR_recovery = mean(HR[in_recovery], na.rm = TRUE),
+    .groups = "drop")
+
+# Add these averages to the subject_info df
+subject_info <- subject_info |>
+  left_join(avg_hr_segments, by = "ID")
+```
+
+10. Find the Avg_RR for each period of GET and add to subject_info
+
+```{r}
+# Calculate Avg_RR_warmup, Avg_RR_effort, Avg_RR_recovery for each unique ID
+avg_rr_segments <- test_measure |>
+  left_join(subject_info, by = "ID") |>
+  mutate(
+    # Check if the time for each row falls within the warmup segment
+    in_warmup = time >= Warmup_start & time <= Warmup_end,
+    # Check if the time for each row falls within the effort segment
+    in_effort = time > Warmup_end & time <= Recovery_start,
+    # Check if the time for each row falls within the recovery segment
+    in_recovery = time > Recovery_start & time <= Recovery_end) |>
+  group_by(ID) |>
+  summarize(
+    Avg_RR_warmup = mean(RR[in_warmup], na.rm = TRUE),
+    Avg_RR_effort = mean(RR[in_effort], na.rm = TRUE),
+    Avg_RR_recovery = mean(RR[in_recovery], na.rm = TRUE),
+    .groups = "drop")
+
+# Add these averages to the subject_info df
+subject_info <- subject_info |>
+  left_join(avg_rr_segments, by = "ID")
+```
+
+## Model building 
+### Part 1 -- Performance rating tiers
+#### Clustering including the demographic info (Age, Height, Weight)
+
+1. Remove the rows that do not have data for VO2, VCO2, and VE measures
+(This will result in 846 rows in subject_info)
+
+```{r}
+# Filter out rows in test_measure where VO2, VCO2, or VE are NA
+valid_ids <- test_measure |>
+  filter(!is.na(VO2) & !is.na(VCO2) & !is.na(VE)) |>
+  pull(ID)
+
+# Remove rows from subject_info where the ID is not in valid_ids
+subject_info <- subject_info |>
+  filter(ID %in% valid_ids)
+```
+
+```{r}
+missing_ids <- setdiff(test_measure$ID, subject_info$ID)
+print(missing_ids)  # Check which IDs are missing
+
+# Merge using left join to prepare for the exponential decay regression analysis
+merged_df <- inner_join(test_measure, subject_info, by = "ID")
+write.csv(merged_df, "merged_df.csv")
+```
+
+```{r}
+summary(merged_df)
+```
+
+
+```{r}
+# Remove the humidity and temperature columns as a test for the silhouette plots since there are NA values in these columns
+subject_info <- subject_info[, !(names(subject_info) %in% c("Humidity", "Temperature"))]
+```
+
+2. Scaling the data 
+Normalize variables (z-score or min-max scaling) to ensure fair weighting
+
+```{r}
+# # Since ID, ID_test, and gender are identification variables- leave them out of the scaling and then add them back to df 
+# Separate the non-numeric columns (that you want to keep) and numeric columns
+non_numeric_cols <- subject_info[, c("Sex", "ID", "ID_test", "Warmup_start"), drop = FALSE]
+numeric_cols <- subject_info[, !(names(subject_info) %in% c("Sex", "ID", "ID_test", "Warmup_start"))]
+
+# Convert the numeric columns to numeric (in case some of them are not correctly formatted)
+numeric_cols <- data.frame(lapply(numeric_cols, as.numeric))
+
+# Scale the numeric columns
+scaled_numeric_cols <- scale(numeric_cols)
+
+# Convert scaled columns into a data frame and mutate them back into the original subject_info
+scaled_subject_info <- subject_info |>
+  select(Sex, ID, ID_test, Warmup_start) |>
+  bind_cols(as.data.frame(scaled_numeric_cols))
+
+# Check the result
+head(scaled_subject_info)
+```
+
+2. Set the parameters for simple clustering
+The parameters we need to set for the K-means algorithm are:
+* x - The data we want the algorithm to cluster
+* centers -  The number of clusters to generate. 
+* itermax - The number of iterations to let k-means perform
+* nstart - The number of starts to try for K-means. Remember K-means may not converge to the optimal solution from a single start point. Therefore we may want to try multiple start points. 
+
+```{r}
+# Going to use columns 5-31 as the variables in the clustering
+# Keep humidity and temperature out of clustering due to NA values and potential to influence clusters too much? 
+
+# Set seed for reproducibility
+set.seed(12345) 
+
+fit_1 <- kmeans(x = scaled_subject_info[,5:31], # Set data as explanatory variables 
+                centers = 4,  # Set number of clusters
+                nstart = 25, # Set number of starts
+                iter.max = 100 ) # Set maximum number of iterations to use
+
+# Extract clusters
+clusters_1 <- fit_1$cluster
+
+# Extract centers
+centers_1 <- fit_1$centers
+```
+
+```{r}
+# Check samples per cluster
+summary(as.factor(clusters_1))
+
+# Check teams in all 4 clusters
+cluster_1_df <- scaled_subject_info[clusters_1 == 1, ]
+cluster_2_df <- scaled_subject_info[clusters_1 == 2, ]
+cluster_3_df <- scaled_subject_info[clusters_1 == 3, ]
+cluster_4_df <- scaled_subject_info[clusters_1 == 4, ]
+```
+
+3. Check how the center values for each of the clusters compare to each other
+
+```{r}
+# Create vector of clusters
+cluster <- c(1:4)
+# Extract centers
+center_df <- data.frame(cluster, centers_1)
+
+# Reshape the data
+center_reshape <- gather(center_df, features, values, 2:28)
+# View first few rows
+head(center_reshape)
+
+# Create plot
+g_heat_1 <- ggplot(data = center_reshape, # Set dataset
+                   aes(x = features, y = cluster, fill = values)) + # Set aesthetics
+  scale_y_continuous(breaks = seq(1, 4, by = 1)) + # Set y axis breaks
+  geom_tile() + # Geom tile for heatmap
+  coord_equal() +  # Make scale the same for both axis
+  theme_set(theme_bw(base_size = 22) ) + # Set theme
+  scale_fill_gradient2(low = "blue", # Choose low color
+                       mid = "white", # Choose mid color
+                       high = "red", # Choose high color
+                       midpoint =0, # Choose mid point
+                       space = "Lab", 
+                       na.value ="grey", # Choose NA value
+                       guide = "colourbar", # Set color bar
+                       aesthetics = "fill") + # Select aesthetics to apply
+  coord_flip() # Rotate plot to view names clearly
+
+# Generate plot
+g_heat_1
+```
+
+The clusters have relatively similar intensities across many features, indicating that they might not be highly distinct.
+* Some features, like Avg_ventilatory_efficiency and Avg_respiratory_exchange_ratio, show strong separation with one cluster having significantly higher values compared to others? 
+* The gradual color transitions across most features suggest moderate differentiation rather than sharply distinct groups.
+* Since the goal is to create clusters that are more distinct from each other, adding more clusters might help reveal subgroups within the existing ones
+
+4. Calculate cluster number & view elbow plot 
+
+```{r}
+# Create function to try different cluster numbers
+kmean_withinss <- function(k) {
+  cluster <- kmeans( x = scaled_subject_info[,5:31],  # Set data to use
+                    centers = k,  # Set number of clusters as k, changes with input into function
+                    nstart = 25, # Set number of starts
+                    iter.max = 100) # Set max number of iterations
+  return (cluster$tot.withinss)} # Return cluster error/within cluster sum of squares
+
+# Set maximum cluster number
+max_k <-20
+# Run algorithm over a range of cluster numbers 
+wss <- sapply(2:max_k, kmean_withinss)
+
+# Create a data frame to plot the graph
+elbow <-data.frame(2:max_k, wss)
+
+# Plot the graph with ggplot
+g_e1 <- ggplot(elbow, # Set dataset
+              aes(x = X2.max_k, y = wss)) + # Set aesthetics
+  theme_set(theme_bw(base_size = 22) ) + # Set theme
+  geom_point(color = "blue") + # Set geom point for scatter
+  geom_line() + # Geom line for a line between points
+  scale_x_continuous(breaks = seq(1, 20, by = 1)) + # Set breaks for x-axis
+  labs(x = "Number of Clusters", y="Within Cluster \nSum of Squares") + # Set labels
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+
+# Generate plot
+g_e1
+```
+
+Looks like maybe 9 is the ideal number according to the elbow plot? 
+
+5. Try new number of clusters from above 
+
+```{r}
+set.seed(12345) # Set seed for reproducibility
+
+fit_2 <- kmeans(x = scaled_subject_info[5:31], # Set data as explanatory variables 
+                centers = 9,  # Set number of clusters
+                nstart = 25, # Set number of starts
+                iter.max = 100 ) # Set maximum number of iterations to use
+
+# Extract clusters
+clusters_2 <- fit_2$cluster
+
+# Extract centers
+centers_2 <- fit_2$centers
+```
+
+```{r}
+# Check samples per cluster
+summary(as.factor(clusters_2))
+
+# Check athletes in all 9 clusters
+# Overwriting the previous dfs with the clusters since deemed that 4 clusters wasn't ideal for this problem
+cluster_1_df <- scaled_subject_info[clusters_2 == 1, ]
+cluster_2_df <- scaled_subject_info[clusters_2 == 2, ]
+cluster_3_df <- scaled_subject_info[clusters_2 == 3, ]
+cluster_4_df <- scaled_subject_info[clusters_2 == 4, ]
+cluster_5_df <- scaled_subject_info[clusters_2 == 5, ]
+cluster_6_df <- scaled_subject_info[clusters_2 == 6, ]
+cluster_7_df <- scaled_subject_info[clusters_2 == 7, ]
+cluster_8_df <- scaled_subject_info[clusters_2 == 8, ]
+cluster_9_df <- scaled_subject_info[clusters_2 == 9, ]
+```
+
+Cluster 8 only has 1 athlete in it. Either this athlete is very unique or possibly chose incorrect number of clusters?
+
+```{r}
+write.csv(cluster_1_df, "cluster_1_df_p1.csv", row.names = FALSE)
+write.csv(cluster_2_df, "cluster_2_df_p1.csv", row.names = FALSE)
+write.csv(cluster_3_df, "cluster_3_df_p1.csv", row.names = FALSE)
+write.csv(cluster_4_df, "cluster_4_df_p1.csv", row.names = FALSE)
+write.csv(cluster_5_df, "cluster_5_df_p1.csv", row.names = FALSE)
+write.csv(cluster_6_df, "cluster_6_df_p1.csv", row.names = FALSE)
+write.csv(cluster_7_df, "cluster_7_df_p1.csv", row.names = FALSE)
+write.csv(cluster_8_df, "cluster_8_df_p1.csv", row.names = FALSE)
+write.csv(cluster_9_df, "cluster_9_df_p1.csv", row.names = FALSE)
+```
+
+
+6. Check quality of clustering solution with silhouette plot
+We can analyse our clustering solution using:
+* Visual Inspection
+* Clustering Cardinality - Number of samples in each cluster
+* Clustering Magnitude - Sum of distances of points to cluster center
+
+```{r}
+# Calculate distance between samples
+dis <- dist(scaled_subject_info[5:31])
+
+# Set plotting parameters to view plot
+op <- par(mfrow= c(1,1), oma= c(0,0, 3, 0),
+          mgp= c(1.6,.8,0), mar= .1+c(4,2,2,2))
+
+# Create silhouette object for k=4
+sil1 = silhouette(fit_1$cluster, dis, full = TRUE)
+
+# Extract the number of clusters
+num_clusters1 <- max(fit_1$cluster)
+
+# Plot silhouette for each cluster individually
+for (i in 1:num_clusters1) {
+  # Subset data for the i-th cluster
+  cluster_sil <- sil1[sil1[, 1] == i, ]
+  
+  # Plot the silhouette for this cluster
+  plot(cluster_sil[, 2], main = paste("Silhouette for Cluster", i), type = "h")}
+```
+
+```{r}
+# Create silhouette object for k=9
+sil2 = silhouette(fit_2$cluster, dis, full = TRUE)
+
+# Extract the number of clusters
+num_clusters2 <- max(fit_2$cluster)
+
+# Plot silhouette for clusters 1 to 5
+for (i in 1:5) {
+  cluster_sil <- sil2[sil2[, 1] == i, ]
+  plot(cluster_sil[, 2], main = paste("Silhouette for Cluster", i), type = "h")
+}
+```
+
+```{r}
+# This code is not working to produce the silhouette plots
+# Ignore error for now -- consult before submission
+
+# # Plot silhouette for clusters 6 to 9
+# for (i in 6:num_clusters2) {
+#   cluster_sil <- sil2[sil2[, 1] == i, ]
+#   plot(cluster_sil[, 2], main = paste("Silhouette for Cluster", i), type = "h")
+# }
+```
+
+7. Looking at the cardinality of the clustering 
+
+```{r}
+plot_clust_cardinality <- cbind.data.frame(clusters_1, clusters_2) # Join clusters with  k =4 and k=9
+
+names(plot_clust_cardinality) <- c("k_4", "k_9") # Set names
+
+# Create bar plots
+g_2 <- ggplot(plot_clust_cardinality, aes( x = factor(k_4))) + # Set x as cluster values
+  geom_bar(stat = "count", fill = "steelblue") + # Use geom_bar with stat = "count" to count observations
+    labs(x = "Cluster Number", y="Points in Cluster", # Set labels
+         title = "Cluster Cardinality (k = 4)") +
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+
+
+g_3 <- ggplot(plot_clust_cardinality, aes( x = factor(k_9))) + # Set x as cluster values
+  geom_bar(stat = "count", fill = "steelblue") + # Use geom_bar with stat = "count" to count observations
+    labs(x = "Cluster Number", y="Points in Cluster", # Set labels
+         title = "Cluster Cardinality (k = 9)") +
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+
+# Generate bar plots
+g_2
+g_3
+```
+
+Looking for clusters that are major outliers. When k=9, cluster 8 has only one point compared to the other clusters and would warrant investigation.
+
+8. Find the cluster magnitiude
+Visualize the "within cluster" sum of squares for each cluster to see how good a fit each of the clusters was fit
+
+```{r}
+k_4_mag <- cbind.data.frame(c(1:4), fit_1$withinss) # Extract within cluster sum of squares
+
+names(k_4_mag) <- c("cluster", "withinss") # Fix names for plot data
+
+# Create bar plot
+g_4 <- ggplot(k_4_mag, aes(x = cluster, y = withinss)) + # Set x as cluster, y as withinss
+  geom_bar(stat = "identity", fill = "steelblue") + # Use geom bar and stat = "identity" to plot values directly
+   labs(x = "Cluster Number", y="Total Point to Centroid Distance", # Set labels
+         title = "Cluster Magnitude (k = 4)") +
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+  
+k_9_mag <- cbind.data.frame(c(1:9), fit_2$withinss) # Extract within cluster sum of squares
+names(k_9_mag) <- c("cluster", "withinss") # Fix names for plot data
+
+# Create bar plot
+g_5 <- ggplot(k_9_mag, aes(x = cluster, y = withinss)) +  # Set x as cluster, y as withinss
+  geom_bar(stat = "identity", fill = "steelblue") + # Use geom bar and stat = "identity" to plot values directly
+   labs(x = "Cluster Number", y="Total Point to Centroid Distance", # Set labels
+         title = "Cluster Magnitude (k = 9)") +
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+
+# Generate plots
+g_4
+g_5
+```
+
+From the above plots can deduce that clusters with a higher number of samples are likely to have a higher within cluster sum of squares and vice versa?
+
+9. Can plot these two values from above against each other to see the relationship
+
+```{r}
+k_4_dat <- cbind.data.frame(table(clusters_1), k_4_mag[,2]) # Join magnitude and cardinality
+
+names(k_4_dat) <- c("cluster", "cardinality", "magnitude") # Fix plot data names
+
+# Create scatter plot
+g_6 <- ggplot(k_4_dat, aes(x = cardinality, y = magnitude, color = cluster)) + # Set aesthetics
+  geom_point(alpha = 0.8, size  = 4) +  # Set geom point for scatter
+ geom_smooth(aes(x = cardinality, y = magnitude), method = "lm",
+              se = FALSE, inherit.aes = FALSE, alpha = 0.5) + # Set trend  line
+  labs(x = "Cluster Cardinality", y="Total Point to Centroid Distance", # Set labels
+         title = "Cluster Magnitude vs Cardinality \n(k = 4)") +
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+
+k_9_dat <- cbind.data.frame(table(clusters_2), k_9_mag[,2]) # Join magnitude and cardinality
+
+names(k_9_dat) <- c("cluster", "cardinality", "magnitude") # Fix plot data names
+
+# Create scatter plot
+g_7 <- ggplot(k_9_dat, aes(x = cardinality, y = magnitude, color = cluster)) + # Set aesthetics
+  geom_point(alpha = 0.8, size = 4) +  # Set geom point for scatter
+  geom_smooth(aes(x = cardinality, y = magnitude), method = "lm",
+              se = FALSE, inherit.aes = FALSE, alpha = 0.5) + # Set trend  line
+  labs(x = "Cluster Cardinality", y="Total Point to Centroid Distance", # Set labels
+         title = "Cluster Magnitude vs Cardinality \n(k = 9)") +
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+
+# Generate scatter plots
+g_6
+g_7
+```
+
+We can find anomalous clusters by looking for points where the cardinality does not correlate with magnitude relative to the other clusters in the dataset, i.e. is far from the fitted line. For the clustering when k=4 we see a few points that are quite far off the fitted line, while when k=9 the samples fit slightly more closely but both are doing quite well. 
+
+10. Try removing the 1 row/athlete that is in cluster 8 alone for better clustering
+
+```{r}
+# Drop small cluster samples
+scaled_subject_info2 <- scaled_subject_info[!scaled_subject_info$ID == 466,]
+```
+
+11. Visualize the number of clusters that is now optimum for the dataset after removing cluster 8 row
+
+```{r}
+# Create function to try different cluster numbers
+kmean_withinss <- function(k) {
+  cluster <- kmeans( x = scaled_subject_info2[,5:31],  # Set data to use
+                    centers = k,  # Set number of clusters as k, changes with input into function
+                    nstart = 25, # Set number of starts
+                    iter.max = 100) # Set max number of iterations
+  return (cluster$tot.withinss) # Return cluster error/within cluster sum of squares
+}
+
+
+# Set maximum cluster number
+max_k <-20
+# Run algorithm over a range of cluster numbers 
+wss <- sapply(2:max_k, kmean_withinss)
+
+
+# Create a data frame to plot the graph
+elbow <-data.frame(2:max_k, wss)
+
+# Plot the graph with gglop
+g_8 <- ggplot(elbow, aes(x = X2.max_k, y = wss)) +
+  theme_set(theme_bw(base_size = 22) ) +
+  geom_point(color = "blue") +
+  geom_line() +
+  scale_x_continuous(breaks = seq(1, 20, by = 1)) +
+  labs(x = "Number of Clusters", y="Within Cluster \nSum of Squares") +
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+g_8
+```
+
+Again this is pretty uninformative, so try using some other methods for choosing cluster number. For these can use:
+* Average silhouette width 
+* The gap statistic
+
+The average silhouette width uses the silhouette measure we have been using previously and uses the average width as a measure of error. The Gap statistic compares the inter cluster variation for different values of K with their expected values if there was no obvious clustering in the data. It works by generating random values for each variable, clustering them and then comparing the within cluster sum of squares to the clustering solution on the original data. 
+
+The gap statistic process is:
+* Cluster the data with different values of k, calculate the within cluster sum of squares
+* Generate B bootstrap datasets with random values for each observation, where the random values fall within the minimum and maximum values of the observed data. Compute the within cluster sum of squares. 
+* Calculate deviation between random and observed data clusterings. (Gap Statistic)
+* Choose smallest k such that the gap statistic for k is less than 1 standard deviation from the highest gap statistic value. 
+
+12. Plot the silhouette value for multiple different numbers of clusters using `fviz_nbclust()`
+
+```{r}
+# Create silhouette plot summary
+fviz_nbclust(scaled_subject_info2[,5:31], # Set dataset
+             kmeans,# Set clustering method
+             method = "silhouette") # Set evaluation method
+```
+
+13. Calculate the gap statistic
+
+```{r Gap stat}
+# compute gap statistic
+set.seed(999999)
+gap_stat <- clusGap(scaled_subject_info2[,5:31], FUN = kmeans, nstart = 25,
+                    K.max = 20, B = 50)
+
+# Print the result
+print(gap_stat, method = "firstmax")
+
+# Visulaize Result
+fviz_gap_stat(gap_stat)
+```
+
+14. Proceed with 14 clusters according to the gap stat 
+
+```{r}
+set.seed(12345) # Set seed for reproducibility
+
+fit_3 <- kmeans(x =scaled_subject_info2[5:31], # Set data as explanatory variables 
+                centers = 14,  # Set number of clusters
+                nstart = 25, # Set number of starts
+                iter.max = 100 ) # Set maximum number of iterations to use
+
+# Extract clusters
+clusters_3 <- fit_3$cluster
+
+# Extract centers
+centers_3 <- fit_3$centers
+
+# Check samples per cluster
+summary(as.factor(clusters_3))
+```
+
+```{r}
+# Check athletes in all 14 clusters
+# Overwriting the previous dfs with the clusters 
+cluster_1_df <- scaled_subject_info[clusters_3 == 1, ]
+cluster_2_df <- scaled_subject_info[clusters_3 == 2, ]
+cluster_3_df <- scaled_subject_info[clusters_3 == 3, ]
+cluster_4_df <- scaled_subject_info[clusters_3 == 4, ]
+cluster_5_df <- scaled_subject_info[clusters_3 == 5, ]
+cluster_6_df <- scaled_subject_info[clusters_3 == 6, ]
+cluster_7_df <- scaled_subject_info[clusters_3 == 7, ]
+cluster_8_df <- scaled_subject_info[clusters_3 == 8, ]
+cluster_9_df <- scaled_subject_info[clusters_3 == 9, ]
+cluster_10_df <- scaled_subject_info[clusters_3 == 10, ]
+cluster_11_df <- scaled_subject_info[clusters_3 == 11, ]
+cluster_12_df <- scaled_subject_info[clusters_3 == 12, ]
+cluster_13_df <- scaled_subject_info[clusters_3 == 13, ]
+cluster_14_df <- scaled_subject_info[clusters_3 == 14, ]
+```
+
+```{r}
+write.csv(cluster_1_df, "cluster_1_df_p2.csv", row.names = FALSE)
+write.csv(cluster_2_df, "cluster_2_df_p2.csv", row.names = FALSE)
+write.csv(cluster_3_df, "cluster_3_df_p2.csv", row.names = FALSE)
+write.csv(cluster_4_df, "cluster_4_df_p2.csv", row.names = FALSE)
+write.csv(cluster_5_df, "cluster_5_df_p2.csv", row.names = FALSE)
+write.csv(cluster_6_df, "cluster_6_df_p2.csv", row.names = FALSE)
+write.csv(cluster_7_df, "cluster_7_df_p2.csv", row.names = FALSE)
+write.csv(cluster_8_df, "cluster_8_df_p2.csv", row.names = FALSE)
+write.csv(cluster_9_df, "cluster_9_df_p2.csv", row.names = FALSE)
+write.csv(cluster_10_df, "cluster_10_df_p2.csv", row.names = FALSE)
+write.csv(cluster_11_df, "cluster_11_df_p2.csv", row.names = FALSE)
+write.csv(cluster_12_df, "cluster_12_df_p2.csv", row.names = FALSE)
+write.csv(cluster_13_df, "cluster_13_df_p2.csv", row.names = FALSE)
+write.csv(cluster_14_df, "cluster_14_df_p2.csv", row.names = FALSE)
+```
+
+15. Look at the cluster centers and see how they compare
+
+```{r}
+# Create cluster vector
+cluster <- c(1:14)
+# Join cluster vector and centers
+center_df <- data.frame(cluster, centers_3)
+
+# Reshape the data
+center_reshape <- gather(center_df, features, values, 2:28)
+# View first few rows
+head(center_reshape)
+
+# Create plot
+g_heat_2 <- ggplot(data = center_reshape, # Set dataset
+                   aes(x = features, y = cluster, fill = values)) + # Set aesthetics
+  scale_y_continuous(breaks = seq(1, 2, by = 1)) + # Set y axis breaks
+  geom_tile() + # Set geom tile for heatmap
+  coord_equal() +  # Set coord equal 
+  theme_bw() + # Set theme
+  scale_fill_gradient2(low = "blue", # Choose low color
+                       mid = "white", # Choose mid color
+                       high = "red", # Choose high color
+                       midpoint =0, # Choose mid point
+                       space = "Lab", 
+                       na.value ="grey", # Choose NA value
+                       guide = "colourbar", # Set color bar
+                       aesthetics = "fill") + # Select aesthetics to apply
+  coord_flip() # Rotate plot
+
+# Generate plot
+g_heat_2
+```
+
+16. Using sparse hierarchical clustering to identify features which are useful to include in our clustering model. Need to tune the lambda parameter. Use the function `KMeansSparseCluster.permute()` to tune the lambda parameter
+
+```{r}
+# Run sparse k-means permute to calculate optimal number of varaibles
+km.perm <- KMeansSparseCluster.permute(x = scaled_subject_info2[5:31], # Set data
+                                       K=14, # Set cluster number
+                                       nperms=5) # Set number of permuations
+
+# Print result
+print(km.perm)
+# Visualise result
+plot(km.perm)
+```
+
+The guidance is to choose the w values which results in largest gap statistic, the algorithm will try multiple values and return the value which leads to the best gap statistic. However, this leads to all non-zero coefficients, instead choose the lowest value within one standard deviation, 0.0294. Then use this in clustering algorithm:
+
+```{r}
+# Run sparse K-means with selected value of tuning parameter
+km.sparse <- KMeansSparseCluster(x = scaled_subject_info2[5:31], # Set data
+                                 K=14, # Set cluster number
+                                 wbounds = 4.0206, # Set tuning parameter
+                                 nstart = 25, # Set number of starts
+                                 maxiter=100) # Set number of iterations
+
+# 0.6343 - 0.0294 = 0.6049 <= 0.6177 so then choose 4.0206
+```
+
+```{r}
+# Then extract the cluster and weights for the center values
+
+# Extract clusters
+clusters_4 <- km.sparse[[1]]$Cs 
+
+# Extract weights
+centers_4 <- km.sparse[[1]]$ws 
+```
+
+```{r}
+# Then view the center weights
+# View weights
+centers_4
+```
+
+Here the key variables for separating the data for this dataset are:
+* Age
+* Recovery_start
+* Peak_HR_Speed
+* Max_Speed
+* Weight
+* Reovery_end 
+* Initial_HR
+* Speed_HR_ratio
+* HR_variability 
+* Avg_HR_warmup
+* Height
+* Peak_HR
+* Last_HR
+* VO2_Max
+* HR_recovery_drop_percent
+* Avg_HR_effort
+* Warmup_end
+* Peak_HR_Time
+* HR_recovery_rate
+* VO2_speed_ratio
+* Avg_HR_recovery
+
+#### Clustering excluding the demographic info (Age, Height, Weight)
+
+1. Scaling the data 
+Normalize variables (z-score or min-max scaling) to ensure fair weighting
+
+```{r}
+# Since ID, ID_test, and gender are identification variables- leave them out of the scaling and then add them back to df 
+
+# Separate the non-numeric columns (that you want to keep) and numeric columns
+non_numeric_cols <- subject_info[, c("Sex", "ID", "ID_test", "Warmup_start", "Age", "Weight", "Height"), drop = FALSE]
+numeric_cols <- subject_info[, !(names(subject_info) %in% c("Sex", "ID", "ID_test", "Warmup_start", "Age", "Weight", "Height"))]
+
+# Convert the numeric columns to numeric (in case some of them are not correctly formatted)
+numeric_cols <- data.frame(lapply(numeric_cols, as.numeric))
+
+# Scale the numeric columns
+scaled_numeric_cols <- scale(numeric_cols)
+
+# Convert scaled columns into a data frame and mutate them back into the original subject_info
+scaled_subject_info <- subject_info |>
+  select(Sex, ID, ID_test, Warmup_start, Age, Weight, Height) |>
+  bind_cols(as.data.frame(scaled_numeric_cols))
+
+# Check the result
+head(scaled_subject_info)
+```
+
+2. Set the parameters for simple clustering
+The parameters we need to set for the K-means algorithm are:
+* x - The data we want the algorithm to cluster
+* centers -  The number of clusters to generate. 
+* itermax - The number of iterations to let k-means perform
+* nstart - The number of starts to try for K-means. Remember K-means may not converge to the optimal solution from a single start point. Therefore we may want to try multiple start points. 
+
+```{r}
+# Going to use columns 8-31 as the variables in the clustering
+# Keep humidity and temperature out of clustering due to NA values and potential to influence clusters too much? 
+
+# Set seed for reproducibility
+set.seed(12345) 
+
+fit_1 <- kmeans(x = scaled_subject_info[,8:31], # Set data as explanatory variables 
+                centers = 4,  # Set number of clusters
+                nstart = 25, # Set number of starts
+                iter.max = 100 ) # Set maximum number of iterations to use
+
+# Extract clusters
+clusters_1 <- fit_1$cluster
+
+# Extract centers
+centers_1 <- fit_1$centers
+```
+
+```{r}
+# Check samples per cluster
+summary(as.factor(clusters_1))
+
+# Check teams in all 4 clusters
+cluster_1_df <- scaled_subject_info[clusters_1 == 1, ]
+cluster_2_df <- scaled_subject_info[clusters_1 == 2, ]
+cluster_3_df <- scaled_subject_info[clusters_1 == 3, ]
+cluster_4_df <- scaled_subject_info[clusters_1 == 4, ]
+```
+
+3. Check how the center values for each of the clusters compare to each other
+
+```{r}
+# Create vector of clusters
+cluster <- c(1:4)
+# Extract centers
+center_df <- data.frame(cluster, centers_1)
+
+# Reshape the data
+center_reshape <- gather(center_df, features, values, 2:25)
+# View first few rows
+head(center_reshape)
+
+# Create plot
+g_heat_1 <- ggplot(data = center_reshape, # Set dataset
+                   aes(x = features, y = cluster, fill = values)) + # Set aesthetics
+  scale_y_continuous(breaks = seq(1, 4, by = 1)) + # Set y axis breaks
+  geom_tile() + # Geom tile for heatmap
+  coord_equal() +  # Make scale the same for both axis
+  theme_set(theme_bw(base_size = 22) ) + # Set theme
+  scale_fill_gradient2(low = "blue", # Choose low color
+                       mid = "white", # Choose mid color
+                       high = "red", # Choose high color
+                       midpoint =0, # Choose mid point
+                       space = "Lab", 
+                       na.value ="grey", # Choose NA value
+                       guide = "colourbar", # Set color bar
+                       aesthetics = "fill") + # Select aesthetics to apply
+  coord_flip() # Rotate plot to view names clearly
+
+# Generate plot
+g_heat_1
+```
+
+4. Calculate cluster number & view elbow plot 
+
+```{r}
+# Create function to try different cluster numbers
+kmean_withinss <- function(k) {
+  cluster <- kmeans( x = scaled_subject_info[,8:31],  # Set data to use
+                    centers = k,  # Set number of clusters as k, changes with input into function
+                    nstart = 25, # Set number of starts
+                    iter.max = 100) # Set max number of iterations
+  return (cluster$tot.withinss)} # Return cluster error/within cluster sum of squares
+
+# Set maximum cluster number
+max_k <-20
+# Run algorithm over a range of cluster numbers 
+wss <- sapply(2:max_k, kmean_withinss)
+
+# Create a data frame to plot the graph
+elbow <-data.frame(2:max_k, wss)
+
+# Plot the graph with ggplot
+g_e1 <- ggplot(elbow, # Set dataset
+              aes(x = X2.max_k, y = wss)) + # Set aesthetics
+  theme_set(theme_bw(base_size = 22) ) + # Set theme
+  geom_point(color = "blue") + # Set geom point for scatter
+  geom_line() + # Geom line for a line between points
+  scale_x_continuous(breaks = seq(1, 20, by = 1)) + # Set breaks for x-axis
+  labs(x = "Number of Clusters", y="Within Cluster \nSum of Squares") + # Set labels
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+
+# Generate plot
+g_e1
+```
+
+Looks like maybe 5 is the ideal number according to the elbow plot? 
+
+5. Try new number of clusters from above 
+
+```{r}
+set.seed(12345) # Set seed for reproducibility
+
+fit_2 <- kmeans(x = scaled_subject_info[8:31], # Set data as explanatory variables 
+                centers = 5,  # Set number of clusters
+                nstart = 25, # Set number of starts
+                iter.max = 100 ) # Set maximum number of iterations to use
+
+# Extract clusters
+clusters_2 <- fit_2$cluster
+
+# Extract centers
+centers_2 <- fit_2$centers
+```
+
+```{r}
+# Check samples per cluster
+summary(as.factor(clusters_2))
+
+# Check athletes in all 9 clusters
+# Overwriting the previous dfs with the clusters since deemed that 4 clusters wasn't ideal for this problem
+cluster_1_df <- scaled_subject_info[clusters_2 == 1, ]
+cluster_2_df <- scaled_subject_info[clusters_2 == 2, ]
+cluster_3_df <- scaled_subject_info[clusters_2 == 3, ]
+cluster_4_df <- scaled_subject_info[clusters_2 == 4, ]
+cluster_5_df <- scaled_subject_info[clusters_2 == 5, ]
+```
+
+Cluster 2 only has 1 athlete in it. Either this athlete is very unique or possibly chose incorrect number of clusters?
+
+```{r}
+write.csv(cluster_1_df, "cluster_1_df_p3.csv", row.names = FALSE)
+write.csv(cluster_2_df, "cluster_2_df_p3.csv", row.names = FALSE)
+write.csv(cluster_3_df, "cluster_3_df_p3.csv", row.names = FALSE)
+write.csv(cluster_4_df, "cluster_4_df_p3.csv", row.names = FALSE)
+write.csv(cluster_5_df, "cluster_5_df_p3.csv", row.names = FALSE)
+```
+
+6. Looking at the cardinality of the clustering 
+
+```{r}
+plot_clust_cardinality <- cbind.data.frame(clusters_1, clusters_2) # Join clusters with  k =4 and k=5
+
+names(plot_clust_cardinality) <- c("k_4", "k_5") # Set names
+
+# Create bar plots
+g_2 <- ggplot(plot_clust_cardinality, aes( x = factor(k_4))) + # Set x as cluster values
+  geom_bar(stat = "count", fill = "steelblue") + # Use geom_bar with stat = "count" to count observations
+    labs(x = "Cluster Number", y="Points in Cluster", # Set labels
+         title = "Cluster Cardinality (k = 4)") +
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+
+
+g_3 <- ggplot(plot_clust_cardinality, aes( x = factor(k_5))) + # Set x as cluster values
+  geom_bar(stat = "count", fill = "steelblue") + # Use geom_bar with stat = "count" to count observations
+    labs(x = "Cluster Number", y="Points in Cluster", # Set labels
+         title = "Cluster Cardinality (k = 5)") +
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+
+# Generate bar plots
+g_2
+g_3
+```
+
+Looking for clusters that are major outliers. When k=5, cluster 2 has only one point compared to the other clusters and would warrant investigation.
+
+8. Find the cluster magnitiude
+Visualize the "within cluster" sum of squares for each cluster to see how good a fit each of the clusters was fit
+
+```{r}
+k_4_mag <- cbind.data.frame(c(1:4), fit_1$withinss) # Extract within cluster sum of squares
+
+names(k_4_mag) <- c("cluster", "withinss") # Fix names for plot data
+
+# Create bar plot
+g_4 <- ggplot(k_4_mag, aes(x = cluster, y = withinss)) + # Set x as cluster, y as withinss
+  geom_bar(stat = "identity", fill = "steelblue") + # Use geom bar and stat = "identity" to plot values directly
+   labs(x = "Cluster Number", y="Total Point to Centroid Distance", # Set labels
+         title = "Cluster Magnitude (k = 4)") +
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+  
+k_5_mag <- cbind.data.frame(c(1:5), fit_2$withinss) # Extract within cluster sum of squares
+names(k_5_mag) <- c("cluster", "withinss") # Fix names for plot data
+
+# Create bar plot
+g_5 <- ggplot(k_5_mag, aes(x = cluster, y = withinss)) +  # Set x as cluster, y as withinss
+  geom_bar(stat = "identity", fill = "steelblue") + # Use geom bar and stat = "identity" to plot values directly
+   labs(x = "Cluster Number", y="Total Point to Centroid Distance", # Set labels
+         title = "Cluster Magnitude (k = 5)") +
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+
+# Generate plots
+g_4
+g_5
+```
+
+From the above plots can deduce that clusters with a higher number of samples are likely to have a higher within cluster sum of squares and vice versa?
+
+9. Can plot these two values from above against each other to see the relationship
+
+```{r}
+k_4_dat <- cbind.data.frame(table(clusters_1), k_4_mag[,2]) # Join magnitude and cardinality
+
+names(k_4_dat) <- c("cluster", "cardinality", "magnitude") # Fix plot data names
+
+# Create scatter plot
+g_6 <- ggplot(k_4_dat, aes(x = cardinality, y = magnitude, color = cluster)) + # Set aesthetics
+  geom_point(alpha = 0.8, size  = 4) +  # Set geom point for scatter
+ geom_smooth(aes(x = cardinality, y = magnitude), method = "lm",
+              se = FALSE, inherit.aes = FALSE, alpha = 0.5) + # Set trend  line
+  labs(x = "Cluster Cardinality", y="Total Point to Centroid Distance", # Set labels
+         title = "Cluster Magnitude vs Cardinality \n(k = 4)") +
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+
+k_5_dat <- cbind.data.frame(table(clusters_2), k_5_mag[,2]) # Join magnitude and cardinality
+
+names(k_5_dat) <- c("cluster", "cardinality", "magnitude") # Fix plot data names
+
+# Create scatter plot
+g_7 <- ggplot(k_5_dat, aes(x = cardinality, y = magnitude, color = cluster)) + # Set aesthetics
+  geom_point(alpha = 0.8, size = 4) +  # Set geom point for scatter
+  geom_smooth(aes(x = cardinality, y = magnitude), method = "lm",
+              se = FALSE, inherit.aes = FALSE, alpha = 0.5) + # Set trend  line
+  labs(x = "Cluster Cardinality", y="Total Point to Centroid Distance", # Set labels
+         title = "Cluster Magnitude vs Cardinality \n(k = 5)") +
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+
+# Generate scatter plots
+g_6
+g_7
+```
+
+We can find anomalous clusters by looking for points where the cardinality does not correlate with magnitude relative to the other clusters in the dataset, i.e. is far from the fitted line. For the clustering when k=4 we see a few points that are quite far off the fitted line, while when k=5 the samples fit slightly more closely but both are doing quite well. 
+
+10. Try removing the 1 row/athlete that is in cluster 2 alone for better clustering
+
+```{r}
+# Drop small cluster samples
+scaled_subject_info2 <- scaled_subject_info[!scaled_subject_info$ID == 466,]
+```
+
+11. Visualize the number of clusters that is now optimum for the dataset after removing cluster 2 row
+
+```{r}
+# Create function to try different cluster numbers
+kmean_withinss <- function(k) {
+  cluster <- kmeans( x = scaled_subject_info2[,8:31],  # Set data to use
+                    centers = k,  # Set number of clusters as k, changes with input into function
+                    nstart = 25, # Set number of starts
+                    iter.max = 100) # Set max number of iterations
+  return (cluster$tot.withinss) # Return cluster error/within cluster sum of squares
+}
+
+
+# Set maximum cluster number
+max_k <-20
+# Run algorithm over a range of cluster numbers 
+wss <- sapply(2:max_k, kmean_withinss)
+
+
+# Create a data frame to plot the graph
+elbow <-data.frame(2:max_k, wss)
+
+# Plot the graph with gglop
+g_8 <- ggplot(elbow, aes(x = X2.max_k, y = wss)) +
+  theme_set(theme_bw(base_size = 22) ) +
+  geom_point(color = "blue") +
+  geom_line() +
+  scale_x_continuous(breaks = seq(1, 20, by = 1)) +
+  labs(x = "Number of Clusters", y="Within Cluster \nSum of Squares") +
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+g_8
+```
+
+Again this is pretty uninformative, so try using some other methods for choosing cluster number. For these can use:
+* Average silhouette width 
+* The gap statistic
+
+The average silhouette width uses the silhouette measure we have been using previously and uses the average width as a measure of error. The Gap statistic compares the inter cluster variation for different values of K with their expected values if there was no obvious clustering in the data. It works by generating random values for each variable, clustering them and then comparing the within cluster sum of squares to the clustering solution on the original data. 
+
+The gap statistic process is:
+* Cluster the data with different values of k, calculate the within cluster sum of squares
+* Generate B bootstrap datasets with random values for each observation, where the random values fall within the minimum and maximum values of the observed data. Compute the within cluster sum of squares. 
+* Calculate deviation between random and observed data clusterings. (Gap Statistic)
+* Choose smallest k such that the gap statistic for k is less than 1 standard deviation from the highest gap statistic value. 
+
+12. Plot the silhouette value for multiple different numbers of clusters using `fviz_nbclust()`
+
+```{r}
+# Create silhouette plot summary
+fviz_nbclust(scaled_subject_info2[,8:31], # Set dataset
+             kmeans,# Set clustering method
+             method = "silhouette") # Set evaluation method
+```
+
+13. Calculate the gap statistic
+
+```{r}
+# compute gap statistic
+set.seed(999999)
+gap_stat <- clusGap(scaled_subject_info2[,8:31], FUN = kmeans, nstart = 25,
+                    K.max = 20, B = 50)
+
+# Print the result
+print(gap_stat, method = "firstmax")
+
+# Visulaize Result
+fviz_gap_stat(gap_stat)
+```
+
+14. Proceed with 7 clusters according to the gap stat 
+
+```{r}
+set.seed(12345) # Set seed for reproducibility
+
+fit_3 <- kmeans(x =scaled_subject_info2[8:31], # Set data as explanatory variables 
+                centers = 7,  # Set number of clusters
+                nstart = 25, # Set number of starts
+                iter.max = 100 ) # Set maximum number of iterations to use
+
+# Extract clusters
+clusters_3 <- fit_3$cluster
+
+# Extract centers
+centers_3 <- fit_3$centers
+
+# Check samples per cluster
+summary(as.factor(clusters_3))
+```
+
+```{r}
+# Check athletes in all 7 clusters
+# Overwriting the previous dfs with the clusters 
+cluster_1_df <- scaled_subject_info[clusters_3 == 1, ]
+cluster_2_df <- scaled_subject_info[clusters_3 == 2, ]
+cluster_3_df <- scaled_subject_info[clusters_3 == 3, ]
+cluster_4_df <- scaled_subject_info[clusters_3 == 4, ]
+cluster_5_df <- scaled_subject_info[clusters_3 == 5, ]
+cluster_6_df <- scaled_subject_info[clusters_3 == 6, ]
+cluster_7_df <- scaled_subject_info[clusters_3 == 7, ]
+```
+
+```{r}
+write.csv(cluster_1_df, "cluster_1_df_p4.csv", row.names = FALSE)
+write.csv(cluster_2_df, "cluster_2_df_p4.csv", row.names = FALSE)
+write.csv(cluster_3_df, "cluster_3_df_p4.csv", row.names = FALSE)
+write.csv(cluster_4_df, "cluster_4_df_p4.csv", row.names = FALSE)
+write.csv(cluster_5_df, "cluster_5_df_p4.csv", row.names = FALSE)
+write.csv(cluster_6_df, "cluster_6_df_p4.csv", row.names = FALSE)
+write.csv(cluster_7_df, "cluster_7_df_p4.csv", row.names = FALSE)
+```
+
+15. Look at the cluster centers and see how they compare
+
+```{r}
+# Create cluster vector
+cluster <- c(1:7)
+# Join cluster vector and centers
+center_df <- data.frame(cluster, centers_3)
+
+# Reshape the data
+center_reshape <- gather(center_df, features, values, 2:25)
+# View first few rows
+head(center_reshape)
+
+# Create plot
+g_heat_2 <- ggplot(data = center_reshape, # Set dataset
+                   aes(x = features, y = cluster, fill = values)) + # Set aesthetics
+  scale_y_continuous(breaks = seq(1, 2, by = 1)) + # Set y axis breaks
+  geom_tile() + # Set geom tile for heatmap
+  coord_equal() +  # Set coord equal 
+  theme_bw() + # Set theme
+  scale_fill_gradient2(low = "blue", # Choose low color
+                       mid = "white", # Choose mid color
+                       high = "red", # Choose high color
+                       midpoint =0, # Choose mid point
+                       space = "Lab", 
+                       na.value ="grey", # Choose NA value
+                       guide = "colourbar", # Set color bar
+                       aesthetics = "fill") + # Select aesthetics to apply
+  coord_flip() # Rotate plot
+
+# Generate plot
+g_heat_2
+```
+
+16. Using sparse hierarchical clustering to identify features which are useful to include in our clustering model. Need to tune the lambda parameter. Use the function `KMeansSparseCluster.permute()` to tune the lambda parameter
+
+```{r}
+# Run sparse k-means permute to calculate optimal number of varaibles
+km.perm <- KMeansSparseCluster.permute(x = scaled_subject_info2[8:31], # Set data
+                                       K=7, # Set cluster number
+                                       nperms=5) # Set number of permuations
+
+# Print result
+print(km.perm)
+# Visualise result
+plot(km.perm)
+```
+
+The guidance is to choose the w values which results in largest gap statistic, the algorithm will try multiple values and return the value which leads to the best gap statistic. However, this leads to all non-zero coefficients, instead choose the lowest value within one standard deviation, 0.0294. Then use this in clustering algorithm:
+
+```{r}
+# Run sparse K-means with selected value of tuning parameter
+km.sparse <- KMeansSparseCluster(x = scaled_subject_info2[8:31], # Set data
+                                 K=7, # Set cluster number
+                                 wbounds = 3.3018, # Set tuning parameter
+                                 nstart = 25, # Set number of starts
+                                 maxiter=100) # Set number of iterations
+
+# 0.4955 - 0.0080 = 0.6049 <= 0.4875 so then choose 3.3018
+```
+
+```{r}
+# Then extract the cluster and weights for the center values
+
+# Extract clusters
+clusters_4 <- km.sparse[[1]]$Cs 
+
+# Extract weights
+centers_4 <- km.sparse[[1]]$ws 
+```
+
+```{r}
+# Then view the center weights
+# View weights
+centers_4
+```
+
+Here the key variables for separating the data for this dataset are:
+* Warmup_end
+* Recovery_start
+* Recovery_end
+* Peak_HR
+* Peak_HR_Time
+* Peak_HR_Speed
+* Initial_HR
+* Last_HR
+* Max_Speed
+* Speed_HR_ratio
+* VO2_Max
+* VO2_Speed_ratio
+* HR_variability
+* HR_recovery_drop_percent
+* Avg_HR_warmup
+* Avg_HR_effort
+* Avg_HR_recovery
+
+### Part 2 -- Recovery speed factors 
+
+```{r}
+# Load data
+merged_df <- read.csv("~/Downloads/Performance/Project/merged_df.csv")
+
+# Remove NAs
+merged_df <- na.omit(merged_df)
+
+# Ensure required columns exist
+required_columns <- c("HR_recovery_rate", "VO2_Max", "Speed", "Resp_exchange", "Vent_efficiency", "time")
+missing_columns <- setdiff(required_columns, colnames(merged_df))
+
+if (length(missing_columns) > 0) {
+  stop(paste("Error: Missing columns in dataset:", paste(missing_columns, collapse = ", ")))
+}
+
+# # Ensure 'time' column is positive
+# if (any(merged_df$time <= 0)) {
+#   stop("Error: 'time' column must contain positive values.")
+# }
+```
+
+```{r}
+# Add 1 to time
+merged_df$time <- merged_df$time
+
+# Normalize predictors to prevent numerical instability
+merged_df <- merged_df %>%
+  mutate(across(c(VO2_Max, Speed, Resp_exchange, Vent_efficiency, time), scale))
+
+# Compute safe starting values
+safe_div <- function(x) {
+  range_x <- max(x, na.rm = TRUE) - min(x, na.rm = TRUE)
+  ifelse(range_x == 0, 1, 1 / range_x)
+}
+
+start_a <- max(merged_df$HR_recovery_rate, na.rm = TRUE)
+start_c <- min(merged_df$HR_recovery_rate, na.rm = TRUE)
+
+# Ensure c is positive to avoid log issues
+start_c <- max(start_c, 1e-4)  # Modified to avoid log of zero
+
+start_b1 <- safe_div(merged_df$VO2_Max)
+start_b2 <- safe_div(merged_df$Speed)
+start_b3 <- safe_div(merged_df$Resp_exchange)
+start_b4 <- safe_div(merged_df$Vent_efficiency)
+
+# Create log-transformed HR recovery column safely
+merged_df <- merged_df %>%
+  mutate(log_HR_recovery = log1p(HR_recovery_rate))  # Modified: log() replaced with log1p() to prevent log(0)
+
+# Ensure no NA values were introduced
+if (any(is.na(merged_df$log_HR_recovery))) {
+  stop("Error: Log transformation resulted in NA values.")
+}
+
+# Set parameter bounds to improve numerical stability
+lower_bounds <- c(a = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, c = 0)
+upper_bounds <- c(a = Inf, b1 = 1, b2 = 1, b3 = 1, b4 = 1, c = Inf)
+
+# Try fitting the log model, catch errors
+tryCatch({
+  model_log <- nlsLM(
+    log_HR_recovery ~ log1p(a * exp(-(b1 * VO2_Max + b2 * Speed + b3 * Resp_exchange + b4 * Vent_efficiency) * time) + c),
+    data = merged_df,
+    start = list(a = start_a, b1 = start_b1, b2 = start_b2, b3 = start_b3, b4 = start_b4, c = start_c),
+    lower = lower_bounds,
+    upper = upper_bounds,
+    trace = TRUE,
+    control = nls.lm.control(maxiter = 500)
+  )
+  
+  print(summary(model_log))
+}, error = function(e) {
+  cat("Model failed to converge. Error:", e$message, "\n")
+})
+```
+
+```{r}
+# Re-fit the model with better starting values
+model_factors <- nlsLM(
+  HR_recovery_rate ~ a * exp(-(b1 * VO2_Max + b2 * Speed + b3 * Resp_exchange + b4 * Vent_efficiency) * time) + c,
+  data = merged_df,
+  start = list(a = start_a, b1 = start_b1, b2 = start_b2, b3 = start_b3, b4 = start_b4, c = start_c)
+)
+
+# Summary of results
+summary(model_factors)
+```
+
+### Part 3 -- Athlete trends over time
+
+```{r}
+## Derived Variables:
+# Total "Max Effort" Time (core part of test)
+# recovery start - warmup end
+
+# create the variable using the data from duplicates df
+total_effort <- duplicates |>
+  group_by("ID") |>
+  summarize(total_effort_time = recovery_start_time - warmup_end_time, .groups = "drop")
+
+# Ensure total_effort has unique IDs before joining
+total_effort <- total_effort |> 
+  distinct(ID, .keep_all = TRUE)
+
+# Add total_effort column into more_1_tests
+more_1_tests <- more_1_tests |>
+  left_join(total_effort, by = "ID")
+```
+
+```{r}
+# Max HR
+# create the variable using the data from more_1_tests df
+max_hr <- more_1_tests |> 
+  group_by("ID") |>
+  summarize(peak_hr = max("HR"), .groups = "drop")
+
+# Ensure max_hr has unique IDs before joining
+max_hr <- max_hr |>
+  distinct("ID", .keep_all = TRUE)
+
+# Add peak_hr column into more_1_tests
+more_1_tests <- more_1_tests |>
+  left_join(max_hr, by = "ID")
+
+
+find(max(HR), more_1_tests$ID == 7)
+```
+
+```{r}
+# Max VO2
+# create the variable using the data from more_1_tests df
+max_vo2 <- more_1_tests |> 
+  group_by(ID) |>
+  summarize(peak_vo2 = max(VO2), .groups = "drop")
+
+# Ensure max_vo2 has unique IDs before joining
+max_vo2 <- max_vo2 |>
+  distinct(ID, .keep_all = TRUE)
+
+# Add peak_vo2 column into more_1_tests
+more_1_tests <- more_1_tests |>
+  left_join(max_vo2, by = "ID")
+```
+
+```{r}
+## Data Conversion for Tableau Analysis
+write.csv(duplicates, file = "hp_duplicates.csv")
+write.csv(more_1_tests, file = "hp_more_1_tests.csv")
+```
+
