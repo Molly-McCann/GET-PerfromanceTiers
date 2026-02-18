@@ -1,0 +1,234 @@
+---
+title: "Project Visualizations"
+author: "Molly McCann"
+date: "2025-01-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Libraries 
+
+```{r}
+library(ggplot2)
+library(dplyr)
+```
+
+## Data Setup
+
+```{r}
+# Load in datasets 
+test_measure <- read.csv("~/Downloads/Performance/Project/test_measure.csv")
+subject_info <- read.csv("~/Downloads/Performance/Project/subject-info.csv")
+
+# Combine data based on ID and ID_test major
+data <- merge(test_measure, subject_info, by = c("ID", "ID_test"))
+```
+
+```{r}
+# Function to bin ages into ranges
+bin_ages <- function(data, age_column, bins, labels) {
+  # Create a new column for age bins
+  data$Age_Bin <- cut(data[[age_column]], breaks = bins, labels = labels, right = FALSE)
+  return(data)
+}
+
+# Define age bins and labels
+age_bins <- c(10, 15, 20, 25, 30, 40, 50, 60, 63) 
+age_labels <- c("10-14", "15-19", "20-24", "25-29", "30-39", "40-49", "50-59", "60-63") 
+
+# Apply the function to the subject_info dataset
+data <- bin_ages(data, age_column = "Age", bins = age_bins, labels = age_labels)
+
+# View the first few rows with the new column
+head(data)
+```
+
+```{r}
+# Only look at IDs 1-10
+data_1 <- data |> 
+  filter(ID %in% c(1:10))
+```
+
+## Visual 1 -- VO2 Mean Measures for IDs 1:10
+
+```{r}
+# Function to calculate the mean for a column grouped by the unique IDs
+calc_mean <- function(data, id_column, value_column) {
+  # Group by the ID column and calculate mean for the value column
+  mean_values <- data |>
+    group_by(.data[[id_column]]) |>
+    summarize(mean_value = mean(.data[[value_column]], na.rm = TRUE), .groups = "drop")
+  
+  return(mean_values)
+}
+```
+
+```{r}
+# Calculate the mean of VO2 for each ID
+vo2_1 <- calc_mean(data_1, id_column = "ID", value_column = "VO2")
+print(vo2_1)
+
+# Add the Mean_VO2 as a column in data_1
+data_1 <- data_1 |>
+  left_join(vo2_1, by = "ID") |>
+  rename(Mean_VO2 = mean_value)
+```
+
+```{r}
+# Create plot
+plot_1 <- ggplot(data_1, # Set dataset
+              aes(x = ID, y = Mean_VO2, color = Age_Bin)) + # Set aesthetics
+  geom_point(size = 4) + # Set geom point for scatter plot
+   theme(axis.line = element_line(colour = "black"), # Set axis line as black
+         axis.text.x = element_text(angle = 90), # Rotate x-axis labels
+        panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) + # Remove grid 
+labs(x = "ID", y = "VO2", color = "Age", # Set labels
+     title = "ID - VO2 Mean Measures") 
+
+plot_1
+```
+
+This visualization shows the mean VO2 measures for subjects with ID numbers 1-10. The subjects were put into age groups and due to the small sample size included in the visual, some age groups appear more frequently than others. It is noted that higher VO2 values are distributed across multiple age groups rather than being concentrated in one.
+
+## Visual 2 -- VO2 Max Measures for IDs 1:10
+
+```{r}
+# Function to calculate the max for a column grouped by the unique IDs
+calc_max <- function(data, id_column, value_column) {
+  # Group by the ID column and calculate mean for the value column
+  max_values <- data |>
+    group_by(.data[[id_column]]) |>
+    summarize(max_value = max(.data[[value_column]], na.rm = TRUE), .groups = "drop")
+  
+  return(max_values)
+}
+```
+
+```{r}
+# Calculate the max of VO2 for each ID
+vo2_2 <- calc_max(data_1, id_column = "ID", value_column = "VO2")
+print(vo2_2)
+
+# Add the Mean_VO2 as a column in data_1
+data_1 <- data_1 |>
+  left_join(vo2_2, by = "ID") |>
+  rename(Max_VO2 = max_value)
+```
+
+```{r}
+# Create plot
+plot_2 <- ggplot(data_1, # Set dataset
+              aes(x = ID, y = Max_VO2, color = Age_Bin)) + # Set aesthetics
+  geom_point(size = 4) + # Set geom point for scatter plot
+   theme(axis.line = element_line(colour = "black"), # Set axis line as black
+         axis.text.x = element_text(angle = 90), # Rotate x-axis labels
+        panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) + # Remove grid 
+labs(x = "ID", y = "VO2", color = "Age", # Set labels
+     title = "ID - VO2 Max Measures") 
+
+plot_2
+```
+
+In this visualization, it is observed that higher VO2 max values appear to be spread across multiple age groups rather than concentrated in a single one. Additionally there appears to be no type of trend amongst the age groups on a sample size this small. 
+
+## Visual 3 -- VO2 Max Measures for all IDs
+
+```{r}
+# Calculate the max of VO2 for each ID
+vo2_3 <- calc_max(data, id_column = "ID", value_column = "VO2")
+print(vo2_3)
+
+# Add the Mean_VO2 as a column in data_1
+data <- data |>
+  left_join(vo2_3, by = "ID") |>
+  rename(Max_VO2 = max_value)
+```
+
+```{r}
+# Create plot
+plot_3 <- ggplot(data, # Set dataset
+              aes(x = ID, y = Max_VO2, color = Age_Bin)) + # Set aesthetics
+  geom_point(size = 4) + # Set geom point for scatter plot
+   theme(axis.line = element_line(colour = "black"), # Set axis line as black
+         axis.text.x = element_text(angle = 90), # Rotate x-axis labels
+        panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) + # Remove grid 
+labs(x = "ID", y = "VO2", color = "Age", # Set labels
+     title = "ID - VO2 Max Measures") 
+
+plot_3
+```
+
+This visualization attempts to see if there is a trend among the age groups for VO2 max values; however the data appears to have no such trend among age groups. 
+
+## Visual 4 -- Bar chart of what time(s) peak heart rate was acheived for all IDs
+
+```{r}
+# Calculate the max HR for each ID
+hr_1 <- calc_max(data, id_column = "ID", value_column = "HR")
+print(hr_1)
+
+# Add the Mean_VO2 as a column in data_1
+data <- data |>
+  left_join(hr_1, by = "ID") |>
+  rename(Peak_HR = max_value)
+```
+
+```{r}
+# Find time peak heart rate occurred
+peak_hr_time <- data |>
+  filter(HR == Peak_HR) |> 
+  select(ID, time)         
+
+# Create bins for the times
+bin_times <- function(data, time_column, bins, labels) {
+  # Create a new column for age bins
+  data$Time_Bin <- cut(data[[time_column]], breaks = bins, labels = labels, right = FALSE)
+  return(data)
+}
+
+# Define age bins and labels
+time_bins <- c(0, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 660, 720, 780, 840, 900, 960, 1020, 1080, 1140, 1200, 1260) 
+time_labels <- c("1 min", "2 min", "3 min", "4 min", "5 min", "6 min", "7 min", "8 min", "9 min", "10 min", "11 min", "12 min", "13 min", "14 min", "15 min", "16 min", "17 min", "18 min", "19 min", "20 min", "21 min") 
+
+# Apply the function to the subject_info dataset
+data <- bin_times(data, time_column = "time", bins = time_bins, labels = time_labels)
+
+# Create binned time column in peak_hr_time
+peak_hr_time <- peak_hr_time |>
+  mutate(Time_Bin = cut(time, breaks = time_bins, labels = time_labels, right = FALSE))
+```
+
+```{r}
+# Create plot
+plot_4 <- ggplot(peak_hr_time, aes(x = Time_Bin)) +  # Set dataset and categorical x-axis
+  geom_bar(fill = "blue", alpha = 0.8) +  
+  theme(
+    axis.line = element_line(colour = "black"),  # Set axis line as black
+    axis.text.x = element_text(angle = 90, hjust = 1),  # Rotate x-axis labels for readability
+    panel.grid.major = element_blank(),  # Remove major grid
+    panel.grid.minor = element_blank(),  # Remove minor grid
+    panel.border = element_blank(),  # Remove border
+    panel.background = element_blank()) + # Remove grid
+  labs(
+    x = "Time Interval",
+    y = "Frequency",
+    title = "Times When Peak HR Occurred") 
+
+plot_4
+```
+
+This visualization shows the time in minutes when peak heart rate occurred. It is seen that peak HR most frequently occurred around 15-16 minutes, wuth notable occurrence at 13 minutes. It is interesting to note that this is does not take the frequency when peak heart rate is first achieved, but every instance it is achieved for each ID. 
+
+
